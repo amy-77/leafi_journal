@@ -1,0 +1,1639 @@
+//
+// Created by Qitong Wang on 2022/10/11.
+// Copyright (c) 2022 Université Paris Cité. All rights reserved.
+//
+
+#include "filter.h"
+#include <cmath>
+#include <chrono>
+#include <random>
+#include <iostream>
+#include <csignal>
+#include <fstream>
+
+#include <boost/filesystem.hpp>
+#include <torch/data/example.h>
+#include <torch/data/datasets/base.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include "spdlog/spdlog.h"
+
+#include "str.h"
+#include "vec.h"
+#include "comp.h"
+#include "interval.h"
+#include "dataset.h"
+#include "scheduler.h"
+
+namespace fs = boost::filesystem;
+
+namespace dstree = upcite::dstree;
+namespace constant = upcite::constant;
+
+dstree::Filter::Filter(dstree::Config &config,
+                       ID_TYPE id,
+                       std::reference_wrapper<torch::Tensor> shared_train_queries) :
+    config_(config),
+    id_(id),
+    is_active_(false),
+    global_queries_(shared_train_queries),
+    is_trained_(false),
+    is_distances_preprocessed_(false),
+    is_distances_logged(false),
+    global_data_size_(0),
+    local_data_size_(0),
+    model_setting_ref_(MODEL_SETTING_PLACEHOLDER_REF) {
+  if (config.filter_train_is_gpu_) {
+    // TODO support multiple devices
+    device_ = std::make_unique<torch::Device>(torch::kCUDA,
+                                              static_cast<c10::DeviceIndex>(config.filter_device_id_));
+  } else {
+    device_ = std::make_unique<torch::Device>(torch::kCPU);
+  }
+
+  // delayed until allocated (either in trial or activation)
+  model_ = nullptr;
+
+  if (!config.to_load_index_ && config.filter_train_nexample_ > 0) {
+    global_bsf_distances_.reserve(config.filter_train_nexample_);
+    global_lnn_distances_.reserve(config.filter_train_nexample_);
+
+    // QYL
+    // global_knn_distances_.reserve(config.filter_train_nexample_);
+    lb_distances_.reserve(config.filter_train_nexample_);
+  }
+
+  if (config.filter_is_conformal_) {
+    conformal_predictor_ = std::make_unique<upcite::ConformalRegressor>(config.filter_conformal_core_type_,
+                                                                        config.filter_conformal_confidence_);
+  } else {
+    conformal_predictor_ = nullptr;
+  }
+}
+
+
+// ---------------------------conformal_predictor 的过程---------------------
+RESPONSE dstree::Filter::fit_conformal_predictor(bool is_trial, bool collect_runtime_stat) {
+  // ===================== 阶段1：参数打印与初始化 =====================
+  try {
+    // 添加防御性检查，确保 conformal_predictor_ 已经初始化
+    if (!conformal_predictor_) {
+      conformal_predictor_ = std::make_unique<upcite::ConformalRegressor>(
+          config_.get().filter_conformal_core_type_,
+          config_.get().filter_conformal_confidence_);
+      printf("在 fit_conformal_predictor 中为节点 %ld 创建了新的 ConformalPredictor\n", id_);
+    }
+    
+    // printf("[DEBUG] =========== Entering fit_conformal_predictor ===========\n");
+    // printf("[DEBUG] 当前模式: is_trial=%d, collect_runtime_stat=%d\n", 
+          //  static_cast<int>(is_trial), 
+          //  static_cast<int>(collect_runtime_stat));
+    ID_TYPE num_conformal_examples;
+    // is_trial=0, collect_runtime_stat=0
+    // ===================== 阶段2：确定符合预测样本数量 =====================
+    // printf("[DEBUG] --- 进入样本数量计算阶段 ---\n");
+    if (!collect_runtime_stat) {
+      //进入这个分支
+      printf("[DEBUG] 常规模式：使用全局数据划分验证集\n");
+      ID_TYPE num_global_train_examples = global_data_size_ * config_.get().filter_train_val_split_;
+      ID_TYPE num_global_valid_examples = global_data_size_ - num_global_train_examples;
+
+    num_conformal_examples = num_global_valid_examples;
+
+    // printf("[DEBUG] 全局训练样本量=%ld, 验证样本量=%ld\n", 
+      // num_global_train_examples, num_global_valid_examples);
+  } else {
+    printf("[DEBUG] 运行时统计模式：动态生成样本\n");
+
+    if (config_.get().filter_train_num_global_example_ > 0 && config_.get().filter_train_num_local_example_ >= 0) {
+      printf("[DEBUG] 使用 filter_train_num_global_example_ 配置\n");
+
+      ID_TYPE num_global_train_examples =
+          config_.get().filter_train_num_global_example_ * config_.get().filter_train_val_split_;
+      ID_TYPE num_global_valid_examples = config_.get().filter_train_num_global_example_ - num_global_train_examples;
+
+      num_conformal_examples = num_global_valid_examples;
+    } else if (config_.get().filter_train_nexample_ > 0) {
+      ID_TYPE num_global_train_examples = config_.get().filter_train_nexample_ * config_.get().filter_train_val_split_;
+      ID_TYPE num_global_valid_examples = config_.get().filter_train_nexample_ - num_global_train_examples;
+
+      num_conformal_examples = num_global_valid_examples;
+    } else {
+      num_conformal_examples = 8192;
+    }
+  }
+
+  auto residuals = upcite::make_reserved<ERROR_TYPE>(num_conformal_examples + 2);
+
+  if (collect_runtime_stat) {
+    std::random_device rd;
+    std::mt19937 e2(rd());
+    std::uniform_real_distribution<> dist(0, 1);
+
+    // include two sentry diffs
+    for (ID_TYPE i = 0; i < num_conformal_examples + 2; ++i) {
+      residuals.push_back(dist(e2));
+    }
+  } else {
+    // printf("[DEBUG] 基于真实数据计算残差\n");
+    //训练集的样本数量
+    ID_TYPE num_global_train_examples = global_data_size_ * config_.get().filter_train_val_split_;
+    //验证集的样本数量
+    ID_TYPE num_global_valid_examples = global_data_size_ - num_global_train_examples;
+    VALUE_TYPE max_diff = constant::MIN_VALUE, mean_diff = 0, std_diff = 0;
+    ID_TYPE num_diff = 0;
+    // printf(" 不明白为啥，又算了一遍全局训练样本量=%ld, 验证样本量=%ld\n", 
+    //   num_global_train_examples, num_global_valid_examples);
+
+
+    // ===================== 添加调试打印 =====================
+    printf("\n[DEBUG] 数组大小检查:\n");
+    printf("global_pred_distances_.size() = %zu\n", global_pred_distances_.size());
+    printf("global_lnn_distances_.size() = %zu\n", global_lnn_distances_.size());
+    printf("num_global_train_examples = %d\n", num_global_train_examples);
+    printf("num_conformal_examples = %d\n", num_conformal_examples);
+    printf("global_data_size_ = %d\n", global_data_size_);
+
+      // 边界检查断言
+      if (num_global_train_examples + num_conformal_examples > global_pred_distances_.size() ||
+          num_global_train_examples + num_conformal_examples > global_lnn_distances_.size()) {
+        printf("[ERROR] 数组边界检查失败! 跳过残差计算，使用默认值\n");
+        
+        // 使用默认值
+        residuals.push_back(0);  // 最小误差
+        residuals.push_back(0.5); // 默认中等误差
+        residuals.push_back(1.0); // 最大误差
+      } else {
+        // 遍历验证集，求出真实最近邻距离和预测距离的差值
+        // printf("[DEBUG] 遍历验证集 (共%ld样本)\n", num_global_valid_examples);
+
+    // ===================== 原有残差计算逻辑 =====================
+    for (ID_TYPE conformal_i = 0; conformal_i < num_conformal_examples; ++conformal_i) {
+      // TODO torch::Tensor to ptr is not stable
+      ID_TYPE idx = num_global_train_examples + conformal_i;
+      // printf("[DEBUG] 处理样本 %d (全局索引 %d): ", conformal_i, idx);
+      // printf("pred=%.3f, lnn=%.3f\n", global_pred_distances_[idx], global_lnn_distances_[idx]); 
+      
+      if (global_pred_distances_[idx] > constant::MIN_VALUE && global_pred_distances_[idx] < constant::MAX_VALUE &&
+          !upcite::equals_zero(global_pred_distances_[idx])) {
+        // TODO not necessary for global symmetrical confidence intervals
+        VALUE_TYPE diff = abs(global_pred_distances_[idx] - global_lnn_distances_[idx]);
+        if (diff > max_diff) {
+          max_diff = diff;
+        }
+        mean_diff += diff;
+        num_diff += 1;
+        residuals.emplace_back(diff);
+      }
+    }
+
+    // ===================== 残差统计结果 =====================
+    printf("\n[DEBUG] 残差统计结果:\n");
+    printf("有效残差数量: %d (预期: %d)\n", num_diff, num_conformal_examples);   
+    // printf("[DEBUG] 最大残差=%.3f\n", max_diff);
+
+        if (num_diff < num_conformal_examples) {
+          spdlog::error("adjuster {:d} {:s} collected {:d} pred diff; expected {:d}",
+                      id_, model_setting_ref_.get().model_setting_str, num_diff, num_conformal_examples);
+        }
+        
+        if (num_diff > 0) {
+          //计算误差的均值
+          mean_diff /= num_diff;
+          //计算误差的方差
+          for (ID_TYPE diff_i = 0; diff_i < num_diff; ++diff_i) {
+            std_diff += (residuals[diff_i] - mean_diff) * (residuals[diff_i] - mean_diff);
+          }
+          //误差标准差
+          std_diff = sqrt(std_diff / num_diff);
+          VALUE_TYPE max_normal_value = mean_diff + 3 * std_diff + constant::EPSILON_GAP;
+          max_diff += constant::EPSILON_GAP;
+          if (max_normal_value < max_diff) {
+            max_normal_value = max_diff;
+          }
+          // printf("[DEBUG] 最终残差边界: max_normal_value=%.3f\n", max_normal_value);
+
+          // //向residuals容器中添加一个值为0的哨兵值（sentry value）, 0表示残差的最小可能值，max_normal_value表示最小可能值   add the first of two sentries: 0
+          residuals.push_back(0); 
+          // add the second of two sentries: max range upper boundary previously using the max pred value
+          residuals.push_back(max_normal_value);
+        } else {
+          // 如果没有有效残差，添加默认值
+          printf("[ERROR] 没有有效残差! 使用默认值\n");
+          residuals.push_back(0);   // 最小误差
+          residuals.push_back(0.5); // 默认中等误差
+          residuals.push_back(1.0); // 最大误差
+        }
+        
+        printf("最终residuals大小: %zu (应等于num_diff+2=%d)\n", 
+           residuals.size(), num_diff + 2);
+      }
+    }
+    
+
+  // ===================== 阶段4：核心逻辑分支处理 =====================
+  // printf("------CP: is_trial && !collect_runtime_stat -------\n");
+  if (is_trial && !collect_runtime_stat) {  //现在不用这个
+    printf("[DEBUG] 进入试验模式分支\n");
+    //遍历residual容器中的每个元素，如果元素小于0，则取反
+    for (auto &residual : residuals) { residual = residual < 0 ? -residual : residual; }
+    //对residuals容器中的残差进行升序排序。
+    std::sort(residuals.begin(), residuals.end());
+    printf("[DEBUG] 排序后残差范围: [%.3f ~ %.3f]\n", residuals.front(), residuals.back());
+
+      //根据置信水平计算残差分位数的索引位置
+      auto residual_i = static_cast<ID_TYPE>(static_cast<VALUE_TYPE>(residuals.size())
+          * config_.get().filter_trial_confidence_level_);
+      //设置置信水平，将分位数对应的残差值设置为CP的置信区间半径，true: 表示这是试验模式; false: 表示不进行修正。
+      conformal_predictor_->set_alpha(residuals[residual_i], true, false);
+
+  #ifdef DEBUG
+  //#ifndef DEBUGGED
+  //id_ 是当前过滤器（Filter）的唯一标识符，
+  //model_setting_ref_.get().model_setting_str 是当前模型的设置字符串
+  //filter_trial_confidence_level 是试验模式下的置信度
+      spdlog::debug("trial {:d} {:s} error (half-)interval = {:.3f} @ {:.2f}",
+                    id_, model_setting_ref_.get().model_setting_str,
+                    get_abs_error_interval(), //通过调用 conformal_predictor_->get_alpha()，获取当前CP的置信区间半径
+                    config_.get().filter_trial_confidence_level_);
+  //#endif
+  #endif
+    } else if (!is_trial && collect_runtime_stat) {
+      //这里fit还是计算残差分位数
+      printf("[DEBUG] !is_trial && collect_runtime_stat \n");
+      conformal_predictor_->fit(residuals);
+      printf("[DEBUG] 完成基础符合预测器拟合\n");
+      if (config_.get().filter_conformal_is_smoothen_) {
+        printf("[DEBUG] 启用平滑处理\n");
+
+        auto recalls = upcite::make_reserved<ERROR_TYPE>(num_conformal_examples + 2);
+
+      std::random_device rd;
+      std::mt19937 e2(rd());
+      std::uniform_real_distribution<> dist(0, 1);
+      for (ID_TYPE i = 0; i < num_conformal_examples + 2; ++i) {
+        recalls.push_back(dist(e2));
+      }
+      std::sort(recalls.begin(), recalls.end()); //non-decreasing
+      //调用fit_spline函数，拟合f:recall_i -> alpha_i
+      fit_filter_conformal_spline(recalls);
+    }
+
+    } else if (!is_trial && !collect_runtime_stat) { // is_trail: 背包算法等    collect_runtime_stat：收集运行时统计信息，
+      //  std::signal(SIGSEGV, sigfaultHandler);   
+      // 主要用的是这个
+      printf("[DEBUG] !is_trial && !collect_runtime_stat 进入常规生产模式分支\n");
+      
+      RESPONSE return_code;
+      // 检查 residuals 的有效性
+      if (residuals.empty()) {
+        printf("[ERROR] 残差数组为空，无法拟合! 使用默认值\n");
+        
+        // 填充默认残差值
+        residuals.push_back(0);   // 最小残差
+        residuals.push_back(0.5); // 默认残差
+        residuals.push_back(1.0); // 最大残差
+      }
+      
+      // 计算残差alphas
+      //！！！！！！！！！！！！！！！！！！！
+      try {
+        return_code = conformal_predictor_->fit(residuals);
+      } catch (const std::exception& e) {
+        printf("[ERROR] 保形预测器拟合时发生异常: %s\n", e.what());
+        return_code = FAILURE;
+      }
+
+      if (return_code == FAILURE) {
+        printf("[ERROR] 符合预测器拟合失败! residuals.size()=%ld\n", residuals.size());
+
+        spdlog::error("trial {:d} {:s} failed to get made conformal (with {:d}/{:d} residuals); disable it",
+                      id_, model_setting_ref_.get().model_setting_str, residuals.size(), num_conformal_examples);
+        is_trained_ = false;
+        is_active_ = false;
+      }
+    } else {
+      printf("[ERROR] 非法参数组合! is_trial=%d, collect_runtime_stat=%d\n", 
+        static_cast<int>(is_trial), static_cast<int>(collect_runtime_stat));
+      spdlog::error("trial {:d} {:s} both trial and collect modes were triggered",
+                    id_, model_setting_ref_.get().model_setting_str);
+      return FAILURE;
+    }
+    // printf("[DEBUG] =========== 函数执行完成 ===========\n");
+    return SUCCESS;
+  } catch (const std::exception& e) {
+    printf("[FATAL ERROR] fit_conformal_predictor 发生异常: %s\n", e.what());
+    is_trained_ = false;
+    is_active_ = false;
+    return FAILURE;
+  } catch (...) {
+    printf("[FATAL ERROR] fit_conformal_predictor 发生未知异常\n");
+    is_trained_ = false;
+    is_active_ = false;
+    return FAILURE;
+  }
+}
+
+
+// ---------------------------conformal_predictor 的过程---------------------
+RESPONSE dstree::Filter::fit_batch_conformal_predictor(bool is_trial, 
+                                                const std::vector<ID_TYPE>& calib_batch_indices,
+                                                ID_TYPE examples_per_batch){
+  
+  // printf("[DEBUG] =========== Entering fit_batch_conformal_predictor ===========\n");
+  // printf("[DEBUG] 当前模式: is_trial=%d\n", static_cast<int>(is_trial));
+
+  ID_TYPE num_calib_batches = calib_batch_indices.size();
+  // printf("[DEBUG] 校准批次数: %d, 每批样本数: %d\n", num_calib_batches, examples_per_batch);
+  // 创建多个校准集的残差容器
+  std::vector<std::vector<ERROR_TYPE>> batch_residuals(num_calib_batches);
+  
+  // 对每个校准集批次计算残差
+  for (ID_TYPE batch_idx = 0; batch_idx < num_calib_batches; ++batch_idx) {
+    ID_TYPE start_idx = calib_batch_indices[batch_idx];
+    ID_TYPE end_idx = (batch_idx < num_calib_batches - 1) ?  calib_batch_indices[batch_idx + 1] : global_data_size_;
+    // printf("[DEBUG] 处理校准集 %d/%d (样本范围: %d-%d)\n", 
+    //        batch_idx+1, num_calib_batches, start_idx, end_idx-1);
+
+    VALUE_TYPE max_diff = constant::MIN_VALUE, mean_diff = 0, std_diff = 0;
+    ID_TYPE num_diff = 0;
+
+    // 计算此批次的残差
+    for (ID_TYPE calib_idx = start_idx; calib_idx < end_idx; ++calib_idx) {
+      // TODO torch::Tensor to ptr is not stable
+      if (global_pred_distances_[calib_idx] > constant::MIN_VALUE && 
+          global_pred_distances_[calib_idx] < constant::MAX_VALUE &&
+          !upcite::equals_zero(global_pred_distances_[calib_idx])) {
+        // TODO not necessary for global symmetrical confidence intervals
+        VALUE_TYPE diff = abs(global_pred_distances_[calib_idx] - global_lnn_distances_[calib_idx]);
+        if (diff > max_diff) {
+          max_diff = diff;
+        }
+        mean_diff += diff;
+        num_diff += 1;
+        batch_residuals[batch_idx].push_back(diff);
+      }
+    }
+
+    // 计算统计值并添加哨兵
+    if (num_diff > 0) {
+      mean_diff /= num_diff;
+      // 计算标准差
+      for (ID_TYPE diff_i = 0; diff_i < batch_residuals[batch_idx].size(); ++diff_i) {
+        std_diff += (batch_residuals[batch_idx][diff_i] - mean_diff) * 
+                   (batch_residuals[batch_idx][diff_i] - mean_diff);
+      }
+      std_diff = sqrt(std_diff / num_diff);
+
+      // 添加哨兵值
+      VALUE_TYPE max_normal_value = mean_diff + 3 * std_diff + constant::EPSILON_GAP;
+      max_diff += constant::EPSILON_GAP;
+
+      // printf("[DEBUG] 校准集 %d 最大残差: %.3f, 最大正常值: %.3f\n", 
+      //   batch_idx+1, max_diff, max_normal_value);
+      
+      if (max_normal_value < max_diff) {
+        max_normal_value = max_diff;
+      }
+
+      batch_residuals[batch_idx].push_back(0); // 第一个哨兵：最小值0
+      batch_residuals[batch_idx].push_back(max_normal_value); // 第二个哨兵：最大合理值
+      // printf("[DEBUG] 校准集 %d 统计: 有效样本=%d, 均值=%.3f, 标准差=%.3f, 最大值=%.3f\n", 
+      //        batch_idx+1, num_diff, mean_diff, std_diff, max_diff);
+    } else {
+      printf("[ERROR] 校准集 %d 无有效残差!\n", batch_idx+1);
+      // 添加默认哨兵值
+      batch_residuals[batch_idx].push_back(0);
+      // batch_residuals[batch_idx].push_back(0.1); // 一个小的默认值
+    }
+  }
+
+  if (!is_trial) { 
+    // printf("[DEBUG] 为 %d 个校准集批次分别拟合保形预测器\n", num_calib_batches);
+    // 计算残差alphas
+    // return_code = conformal_predictor_->fit(residuals);
+    // 调用修改后的conformal_predictor_->fit_batch函数
+    // printf("-----进入conformal_predictor_->fit_batch，存储所有batch的误差-----\n");
+    RESPONSE return_code = conformal_predictor_->fit_batch(batch_residuals);
+
+    if (return_code == FAILURE) {
+      printf("[ERROR] 符合预测器拟合失败!\n");
+
+      spdlog::error("filter {:d} {:s} failed in batch conformal fitting; disabling",
+                   id_, model_setting_ref_.get().model_setting_str);
+      is_trained_ = false;
+      is_active_ = false;
+      return FAILURE;
+    } //else {
+      // printf("[DEBUG] 符合预测器拟合成功!\n");
+      // 如果需要平滑处理
+      // printf("filter_conformal_is_smoothen_ = %d\n", config_.get().filter_conformal_is_smoothen_);
+      // if (config_.get().filter_conformal_is_smoothen_) {
+      //   printf("[DEBUG] 为每个校准集批次应用理\n");
+      //   // 需要实现多批次版本的平滑函数 ???
+      // }
+    // }
+  } else {
+    printf("[WARNING] 试验模式下不支持多校准集\n");
+    return FAILURE;
+  }
+  return SUCCESS;
+}
+
+
+
+
+
+
+
+
+
+
+// 这只是针对当前的filter进行训练，
+RESPONSE dstree::Filter::train(bool is_trial) {
+
+//功能：训练一个用于距离预测的机器学习模型（如CNN或线性模型），并结合保形预测（Conformal Prediction）校准预测结果。
+/*
+核心流程：
+预处理：处理距离数据（如平方根转换）。
+数据划分：将数据分为训练集、验证集。
+模型训练：通过反向传播优化模型参数。
+模型选择：根据验证损失保存最佳模型。
+预测与校准：生成预测结果并调用保形预测校准。
+参数：is_trial 表示是否为试验模式（影响后续校准逻辑）。
+*/
+
+  // ========================= 1. 前置检查 ==============================
+  // 检查是否已训练或需要加载预训练模型
+  if (is_trained_ || config_.get().to_load_filters_) {
+    return FAILURE;
+  }
+  // 检查过滤器激活状态与模式合法性
+  if (!is_active_ && !is_trial) {
+    spdlog::error("filter {:d} neither is_active nor is_trial; exit", id_);
+    spdlog::shutdown();
+    exit(FAILURE);
+  }
+
+   // =========================== 2. CUDA流初始化 ==========================
+  // 初始化CUDA流，用于GPU并行计算
+  ID_TYPE stream_id = -1;
+  if (config_.get().filter_train_is_gpu_) {
+        // 获取当前CUDA流的ID（GPU训练时使用）
+    stream_id = at::cuda::getCurrentCUDAStream(config_.get().filter_device_id_).id(); // compiles with libtorch-gpu
+  }
+
+  // ============================= 3. 数据预处理 =============================
+  // 若配置要求移除平方（filter_remove_square_）且未预处理过。 
+  // printf("[DEBUG] 条件检查: filter_remove_square_ = %d, is_distances_preprocessed_ = %d\n", 
+    static_cast<int>(config_.get().filter_remove_square_),  // 布尔转 int
+    static_cast<int>(is_distances_preprocessed_);          // 布尔转 int
+  if (config_.get().filter_remove_square_ && !is_distances_preprocessed_) {
+    // 对全局最近邻距离和最佳搜索距离取平方根
+    for (ID_TYPE i = 0; i < global_data_size_; ++i) {
+      global_lnn_distances_[i] = sqrt(global_lnn_distances_[i]); //对全局最近邻距离取平方根
+      global_bsf_distances_[i] = sqrt(global_bsf_distances_[i]); //对最佳搜索距离取平方根
+    }
+    // printf("global_lnn_distances_.size() = %zu\n", global_lnn_distances_.size());
+    // printf("global_bsf_distances_.size() = %zu\n", global_bsf_distances_.size());
+    // printf("global_data_size_ = %zu\n", global_data_size_);
+    // 对下界距离取平方根（如果存在）
+    if (!lb_distances_.empty()) {
+      for (ID_TYPE i = 0; i < global_data_size_; ++i) {
+        lb_distances_[i] = sqrt(lb_distances_[i]);
+      }
+    }
+    // 对local最近邻距离取平方根（如果存在局部local数据）
+    if (local_data_size_ > 0) {
+      for (ID_TYPE i = 0; i < local_data_size_; ++i) {
+        local_lnn_distances_[i] = sqrt(local_lnn_distances_[i]);
+      }
+    }
+    is_distances_preprocessed_ = true; // 标记已预处理
+  }
+
+
+#ifdef DEBUG
+//#ifndef DEBUGGED
+  if (!is_distances_logged) {
+    // 记录下界距离、最佳搜索距离等预处理后的数据
+    if (!lb_distances_.empty()) {
+      spdlog::debug("filter {:d} s{:d} lb{:s} = {:s}",
+                    id_, stream_id, config_.get().filter_remove_square_ ? "" : "_sq",
+                    upcite::array2str(lb_distances_.data(), global_data_size_));
+    }               //记录下界距离
+
+    spdlog::debug("filter {:d} s{:d} bsf{:s} = {:s}",
+                  id_, stream_id, config_.get().filter_remove_square_ ? "" : "_sq",
+                  upcite::array2str(global_bsf_distances_.data(), global_data_size_));
+                  //记录全局最佳搜索距离
+
+    spdlog::debug("filter {:d} s{:d} gnn{:s} = {:s}",
+                  id_, stream_id, config_.get().filter_remove_square_ ? "" : "_sq",
+                  upcite::array2str(global_lnn_distances_.data(), global_data_size_));
+                  //记录全局最近邻距离
+    if (local_data_size_ > 0) {
+      spdlog::debug("filter {:d} s{:d} lnn{:s} = {:s}",
+                    id_, stream_id, config_.get().filter_remove_square_ ? "" : "_sq",
+                    upcite::array2str(local_lnn_distances_.data(), local_data_size_));
+    }             //记录局部最近邻距离
+
+    is_distances_logged = true;
+  }
+//#endif
+#endif
+
+  // ============================ 5. 数据划分 ====================================
+  //划分训练集和验证机
+  ID_TYPE num_train_examples = global_data_size_ * config_.get().filter_train_val_split_;
+  ID_TYPE num_valid_examples = global_data_size_ - num_train_examples;
+ 
+  torch::Tensor train_data, valid_data;
+  torch::Tensor train_targets, valid_targets;
+
+  // printf("[DEBUG] global_data_size_ = %ld\n", static_cast<long>(global_data_size_));
+  // printf("[DEBUG] local_data_size_ = %ld\n", static_cast<long>(local_data_size_));
+  // -------------------5.1 存在局部数据local data时的处理----------------
+  if (local_data_size_ > 0) {
+  // -------------------5.1.1  获取训练集的全局和局部数据----------------
+    assert(global_data_size_ == config_.get().filter_train_num_global_example_);
+    
+    assert(local_data_size_ == config_.get().filter_train_num_local_example_);
+    //确定全局数据的训练样本数量：
+    ID_TYPE num_global_train_examples = global_data_size_ * config_.get().filter_train_val_split_;
+    //确定局部数据的训练样本数量：
+    ID_TYPE num_local_train_examples = local_data_size_ * config_.get().filter_train_val_split_;
+    
+    //从global_queries_中获取全局训练数据
+    torch::Tensor global_train_data = global_queries_.get().index(
+        {torch::indexing::Slice(0, num_train_examples)}).clone();
+    //从global_lnn_distances_中获取指定训练集数量的全局训练标签：1nn_distance
+    torch::Tensor global_train_targets = torch::from_blob(global_lnn_distances_.data(),
+                                                          num_global_train_examples,
+                                                          torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+    //从local_queries_中获取局部训练数据
+    torch::Tensor local_train_data = torch::from_blob(local_queries_.data(),
+                                                      {num_local_train_examples, config_.get().series_length_},
+                                                      torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+    //从local_lnn_distances_中获取指定训练集数量的局部训练标签：1nn_distance                                                  
+    torch::Tensor local_train_targets = torch::from_blob(local_lnn_distances_.data(),
+                                                         num_local_train_examples,
+                                                         torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+    //合并loca和global数据，作为完整的训练数据(query)和训练标签(dij)
+    train_data = torch::cat({global_train_data, local_train_data}, 0);
+    train_targets = torch::cat({global_train_targets, local_train_targets}, 0);
+    
+  // --------------------------5.1.2  获取验证集的全局和局部数据----------------
+  ID_TYPE num_global_valid_examples = global_data_size_ - num_global_train_examples;
+    ID_TYPE num_local_valid_examples = local_data_size_ - num_local_train_examples;
+
+    torch::Tensor global_valid_data = global_queries_.get().index(
+        {torch::indexing::Slice(num_train_examples, global_data_size_)}).clone();
+    torch::Tensor global_valid_targets = torch::from_blob(global_lnn_distances_.data() + num_global_train_examples,
+                                                          num_global_valid_examples,
+                                                          torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+
+    torch::Tensor local_valid_data = torch::from_blob(
+        local_queries_.data() + num_local_train_examples * config_.get().series_length_,
+        {num_local_valid_examples, config_.get().series_length_},
+        torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+    torch::Tensor local_valid_targets = torch::from_blob(local_lnn_distances_.data() + num_local_train_examples,
+                                                         num_local_valid_examples,
+                                                         torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+
+    valid_data = torch::cat({global_valid_data, local_valid_data}, 0);
+    valid_targets = torch::cat({global_valid_targets, local_valid_targets}, 0);
+
+    num_train_examples = num_global_train_examples + num_local_train_examples;
+    num_valid_examples = num_global_valid_examples + num_local_valid_examples;
+
+    assert(train_data.size(0) == num_train_examples && train_targets.size(0) == num_train_examples);
+    assert(valid_data.size(0) == num_valid_examples && valid_targets.size(0) == num_valid_examples);
+  } else {
+
+    //5.2 不存在局部数据local data时的处理,  仅全局数据时的处理
+    assert(global_data_size_ == config_.get().filter_train_nexample_);
+
+    //train_data是query，train_targets是全局1nn最近距离
+    train_data = global_queries_.get().index({torch::indexing::Slice(0, num_train_examples)}).clone();
+    train_targets = torch::from_blob(global_lnn_distances_.data(),
+                                     num_train_examples,
+                                     torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+
+    valid_data = global_queries_.get().index({torch::indexing::Slice(
+        num_train_examples, global_data_size_)}).clone();
+    valid_targets = torch::from_blob(global_lnn_distances_.data() + num_train_examples,
+                                     num_valid_examples,
+                                     torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+  }
+
+
+  // ============================= 6. 数据加载器初始化 ==============================
+  auto train_dataset = upcite::SeriesDataset(train_data, train_targets);
+  auto train_data_loader = torch::data::make_data_loader<torch::data::samplers::RandomSampler>(
+      train_dataset.map(torch::data::transforms::Stack<>()), config_.get().filter_train_batchsize_);
+
+  // reuse validation examples as conformal examples
+  //这里验证集的数据作为conformal的数据
+  ID_TYPE num_conformal_examples = num_valid_examples;
+  torch::Tensor conformal_data = valid_data;
+  torch::Tensor conformal_targets = valid_targets; //dij, 
+
+  // ==================================== 7. 模型初始化 ==============================
+  // 根据配置创建模型（如CNN或线性模型）
+  model_ = dstree::get_model(config_);
+  model_->to(*device_);
+
+  // ==================================== 8. 训练准备 ================================
+  // 最佳模型状态跟踪，用于提前终止
+  // for early termination
+  std::unordered_map<std::string, torch::Tensor> best_model_state;
+  VALUE_TYPE best_validation_loss = constant::MAX_VALUE;
+  ID_TYPE best_validation_epoch = -1;
+  // 优化器选择（CNN用Adam，其他用SGD）
+  std::shared_ptr<torch::optim::Optimizer> optimizer = nullptr;
+  if (model_->model_type_ == CNN) {
+    optimizer = std::make_shared<torch::optim::Adam>(model_->parameters(), config_.get().filter_train_learning_rate_);
+  } else {
+    optimizer = std::make_shared<torch::optim::SGD>(model_->parameters(), config_.get().filter_train_learning_rate_);
+  }
+  ID_TYPE initial_cooldown_epochs = config_.get().filter_train_nepoch_ / 2;
+
+  //  学习率调整策略（ReduceLROnPlateau）, 用于验证损失
+  upcite::optim::ReduceLROnPlateau lr_scheduler = upcite::optim::ReduceLROnPlateau(
+      *optimizer, initial_cooldown_epochs, optim::MIN, config_.get().filter_lr_adjust_factor_);
+  // 损失函数（均方误差）
+  torch::nn::MSELoss mse_loss(torch::nn::MSELossOptions().reduction(torch::kMean));
+
+#ifdef DEBUG
+  std::vector<float> train_losses, valid_losses, batch_train_losses;
+  train_losses.reserve(config_.get().filter_train_nepoch_);
+  batch_train_losses.reserve(num_train_examples / config_.get().filter_train_batchsize_ + 1);
+
+  valid_losses.reserve(config_.get().filter_train_nepoch_);
+#endif
+
+  //================================= 9. 训练循环 ==============================
+  torch::Tensor batch_data, batch_target;
+  for (ID_TYPE epoch = 0; epoch < config_.get().filter_train_nepoch_; ++epoch) {
+    model_->train(); // 切换至训练模式
+   
+    // 9.1 前向传播与反向传播
+    for (auto &batch : *train_data_loader) {
+      batch_data = batch.data;
+      batch_target = batch.target;
+
+      optimizer->zero_grad();
+
+      torch::Tensor prediction = model_->forward(batch_data);
+
+      torch::Tensor loss = mse_loss->forward(prediction, batch_target);
+      loss.backward(); // 反向传播
+      // 梯度裁剪防止爆炸
+      if (config_.get().filter_train_clip_grad_) {
+        auto norm = torch::nn::utils::clip_grad_norm_(model_->parameters(),
+                                                      config_.get().filter_train_clip_grad_max_norm_,
+                                                      config_.get().filter_train_clip_grad_norm_type_);
+      }
+      optimizer->step();
+
+#ifdef DEBUG
+      batch_train_losses.push_back(loss.detach().item<float>());
+#endif
+    }
+
+#ifdef DEBUG
+    train_losses.push_back(std::accumulate(batch_train_losses.begin(), batch_train_losses.end(), 0.0)
+                               / static_cast<VALUE_TYPE>(batch_train_losses.size()));
+    batch_train_losses.clear();
+#endif
+
+    // 9.2 验证阶段
+    { // evaluate
+      VALUE_TYPE valid_loss = 0;
+
+      c10::InferenceMode guard;
+      model_->eval();  // 切换至评估模式
+
+      torch::Tensor prediction = model_->forward(valid_data);
+
+      valid_loss = mse_loss->forward(prediction, valid_targets).detach().item<VALUE_TYPE>();
+
+#ifdef DEBUG
+      valid_losses.push_back(valid_loss);
+#endif
+      // 记录最佳模型状态
+      if (epoch > initial_cooldown_epochs) {
+        if (best_validation_loss > valid_loss) {
+          best_validation_loss = valid_loss;
+          best_validation_epoch = epoch;
+
+          for (const auto &pair : model_->named_parameters()) {
+            best_model_state[pair.key()] = pair.value().clone();
+          }
+        }
+      }
+      // 学习率调整与早停策略
+      upcite::optim::LR_RETURN_CODE return_code = lr_scheduler.check_step(valid_loss);
+      if (return_code == upcite::optim::EARLY_STOP) {
+        epoch = config_.get().filter_train_nepoch_;
+      }
+    }
+  }
+
+#ifdef DEBUG
+  spdlog::debug("filter {:d} s{:d} {:s} tloss = {:s}",
+                id_, stream_id, model_setting_ref_.get().model_setting_str,
+                upcite::array2str(train_losses.data(), config_.get().filter_train_nepoch_));
+  spdlog::debug("filter {:d} s{:d} {:s} vloss = {:s}",
+                id_, stream_id, model_setting_ref_.get().model_setting_str,
+                upcite::array2str(valid_losses.data(), config_.get().filter_train_nepoch_));
+#endif
+
+  c10::InferenceMode guard;
+
+// ============================ 10. 模型恢复与预测 =============================
+// 恢复最佳模型状态
+  if (best_validation_epoch > initial_cooldown_epochs) {
+#ifdef DEBUG
+    spdlog::debug("filter {:d} s{:d} {:s} restore from e{:d}, vloss {:.4f}",
+                  id_, stream_id, model_setting_ref_.get().model_setting_str,
+                  best_validation_epoch, best_validation_loss);
+#endif
+
+    for (auto &pair : best_model_state) {
+      model_->named_parameters()[pair.first].detach_();
+      model_->named_parameters()[pair.first].copy_(pair.second);
+    }
+  }
+  //调用模型进行评估，对全局数据进行预测
+  model_->eval();
+
+  auto prediction = model_->forward(global_queries_).detach().cpu();
+  assert(prediction.size(0) == global_data_size_);
+  auto *predictions_array = prediction.detach().cpu().contiguous().data_ptr<VALUE_TYPE>();
+  
+  // !!!!!!!!!!!!!!!!!!1  存储模型预测结果到global_pred_distances_
+  global_pred_distances_.insert(global_pred_distances_.end(), predictions_array, predictions_array + global_data_size_);
+ 
+  // 打印 global_pred_distances_ 的 size
+  // printf("Size of global_pred_distances_: %zu\n", global_pred_distances_.size());
+  #ifdef DEBUG
+  spdlog::info("filter {:d}{:s} s{:d} {:s} g_pred{:s} = {:s}",
+               id_, is_trial ? " (trial)" : "",
+               stream_id, model_setting_ref_.get().model_setting_str,
+               config_.get().filter_remove_square_ ? "" : "_sq",
+               upcite::array2str(predictions_array, global_data_size_));
+
+#endif
+
+  if (config_.get().filter_is_conformal_) {
+    //---------------------------------Conformal Prediction---------------------------------
+    //这里就是我们要的，对预测距离进行Conformal Prediction的校准
+    // printf("---------------正式进入CP了,集中注意力---------------\n");
+    fit_conformal_predictor(is_trial); 
+    // fit_conformal_predictor_batch(is_trial);
+    printf("\n");
+  }
+
+ //  net->to(torch::Device(torch::kCPU));
+  c10::cuda::CUDACachingAllocator::emptyCache();
+
+  if (!is_trial) {
+    is_trained_ = true;
+  } else {
+    // TODO should this work around be improved
+    global_pred_distances_.clear();
+  }
+
+  return SUCCESS;
+}
+
+
+//针对每个filter去train一个小模型，包括处理收集数据，训练模型，预测距离，收集误差
+// 这只是针对当前的filter进行训练，而不是针对所有filter进行训练
+RESPONSE dstree::Filter::batch_train(bool is_trial) {
+
+//# 实现多校准集的 batch_train 函数
+  // ========================= 1. 前置检查 ==============================
+  if (is_trained_ || config_.get().to_load_filters_) {
+    return FAILURE;
+  }
+  if (!is_active_ && !is_trial) {
+    spdlog::error("filter {:d} neither is_active nor is_trial; exit", id_);
+    spdlog::shutdown();
+    exit(FAILURE);
+  }
+
+   // =========================== 2. CUDA流初始化 ==========================
+  ID_TYPE stream_id = -1;
+  if (config_.get().filter_train_is_gpu_) {
+    stream_id = at::cuda::getCurrentCUDAStream(config_.get().filter_device_id_).id(); // compiles with libtorch-gpu
+  }
+
+  // ============================= 3. 数据预处理 =============================
+  // 若配置要求移除平方（filter_remove_square_）且未预处理过。 
+  // printf("[DEBUG] 条件检查: filter_remove_square_ = %d, is_distances_preprocessed_ = %d\n", 
+    // static_cast<int>(config_.get().filter_remove_square_),  // 布尔转 int
+    // static_cast<int>(is_distances_preprocessed_));          // 布尔转 int
+  if (config_.get().filter_remove_square_ && !is_distances_preprocessed_) {
+    // 对全局最近邻距离和最佳搜索距离取平方根
+    for (ID_TYPE i = 0; i < global_data_size_; ++i) {
+      global_lnn_distances_[i] = sqrt(global_lnn_distances_[i]); //对全局最近邻距离取平方根
+      global_bsf_distances_[i] = sqrt(global_bsf_distances_[i]); //对最佳搜索距离取平方根
+    }
+    // printf("global_lnn_distances_.size() = %zu\n", global_lnn_distances_.size());
+    // printf("global_bsf_distances_.size() = %zu\n", global_bsf_distances_.size());
+    // printf("global_data_size_ = %zu\n", global_data_size_);
+    // 对下界距离取平方根（如果存在）
+    if (!lb_distances_.empty()) {
+      for (ID_TYPE i = 0; i < global_data_size_; ++i) {
+        lb_distances_[i] = sqrt(lb_distances_[i]);
+      }
+    }
+    // 对local最近邻距离取平方根（如果存在局部local数据）
+    if (local_data_size_ > 0) {
+      for (ID_TYPE i = 0; i < local_data_size_; ++i) {
+        local_lnn_distances_[i] = sqrt(local_lnn_distances_[i]);
+      }
+    }
+    is_distances_preprocessed_ = true; // 标记已预处理
+  }
+
+
+  // ========== 关键修改点 1: 数据划分策略 ==========
+  // 将数据划分为: 训练集、验证集和多个校准集
+  // printf("\n------------ 开始多校准集数据划分----------\n");
+  // 获取批次数量（需要在配置中添加）
+  ID_TYPE num_calib_batches = config_.get().filter_conformal_num_batches_;
+  // 计算各部分数据大小
+  ID_TYPE total_examples = global_data_size_;
+  // 训练集比例（例如60%）
+  float train_ratio = config_.get().filter_train_val_split_; 
+  // 验证集比例（例如5%）
+  float valid_ratio = config_.get().filter_valid_ratio_; // 新配置项
+  // 校准集总比例 = 1 - train_ratio - valid_ratio
+  float calib_total_ratio = 1.0f - train_ratio - valid_ratio;
+
+  ID_TYPE num_train_examples = static_cast<ID_TYPE>(total_examples * train_ratio);
+  ID_TYPE num_valid_examples = static_cast<ID_TYPE>(total_examples * valid_ratio);
+  ID_TYPE num_calib_examples = total_examples - num_train_examples - num_valid_examples;
+  ID_TYPE num_examples_per_calib_batch = num_calib_examples / num_calib_batches;
+  
+  // printf("[DEBUG] 数据划分: 总样本=%d, 训练=%d (%.1f%%), 验证=%d (%.1f%%), 校准总数=%d (%.1f%%)\n",
+  //        total_examples, num_train_examples, train_ratio*100, 
+  //        num_valid_examples, valid_ratio*100,
+  //        num_calib_examples, calib_total_ratio*100);
+  // printf("[DEBUG] 校准集: 批次数=%d, 每批样本=%d\n", 
+  //        num_calib_batches, num_examples_per_calib_batch);         
+  
+  // 创建数据张量
+  torch::Tensor train_data, valid_data;
+  torch::Tensor train_targets, valid_targets;
+  std::vector<torch::Tensor> calib_data_batches(num_calib_batches);
+  std::vector<torch::Tensor> calib_target_batches(num_calib_batches);
+  
+  // 处理全局和局部数据
+  if (local_data_size_ > 0) {
+    // To do list:   本地数据处理（如果需要）
+    // 注意: 需要修改本地数据的划分方式以支持多校准集
+  // -------------------5.1.1  获取训练集的全局和局部数据----------------
+    assert(global_data_size_ == config_.get().filter_train_num_global_example_);
+    
+    assert(local_data_size_ == config_.get().filter_train_num_local_example_);
+    //确定全局数据的训练样本数量：
+    ID_TYPE num_global_train_examples = global_data_size_ * config_.get().filter_train_val_split_;
+    //确定局部数据的训练样本数量：
+    ID_TYPE num_local_train_examples = local_data_size_ * config_.get().filter_train_val_split_;
+    
+    //从global_queries_中获取全局训练数据
+    torch::Tensor global_train_data = global_queries_.get().index(
+        {torch::indexing::Slice(0, num_train_examples)}).clone();
+    //从global_lnn_distances_中获取指定训练集数量的全局训练标签：1nn_distance
+    torch::Tensor global_train_targets = torch::from_blob(global_lnn_distances_.data(),
+                                                          num_global_train_examples,
+                                                          torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+    //从local_queries_中获取局部训练数据
+    torch::Tensor local_train_data = torch::from_blob(local_queries_.data(),
+                                                      {num_local_train_examples, config_.get().series_length_},
+                                                      torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+    //从local_lnn_distances_中获取指定训练集数量的局部训练标签：1nn_distance                                                  
+    torch::Tensor local_train_targets = torch::from_blob(local_lnn_distances_.data(),
+                                                         num_local_train_examples,
+                                                         torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+    //合并loca和global数据，作为完整的训练数据(query)和训练标签(dij)
+    train_data = torch::cat({global_train_data, local_train_data}, 0);
+    train_targets = torch::cat({global_train_targets, local_train_targets}, 0);
+    
+  // --------------------------5.1.2  获取验证集的全局和局部数据----------------
+  ID_TYPE num_global_valid_examples = global_data_size_ - num_global_train_examples;
+    ID_TYPE num_local_valid_examples = local_data_size_ - num_local_train_examples;
+
+    torch::Tensor global_valid_data = global_queries_.get().index(
+        {torch::indexing::Slice(num_train_examples, global_data_size_)}).clone();
+    torch::Tensor global_valid_targets = torch::from_blob(global_lnn_distances_.data() + num_global_train_examples,
+                                                          num_global_valid_examples,
+                                                          torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+
+    torch::Tensor local_valid_data = torch::from_blob(
+        local_queries_.data() + num_local_train_examples * config_.get().series_length_,
+        {num_local_valid_examples, config_.get().series_length_},
+        torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+    torch::Tensor local_valid_targets = torch::from_blob(local_lnn_distances_.data() + num_local_train_examples,
+                                                         num_local_valid_examples,
+                                                         torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+
+    valid_data = torch::cat({global_valid_data, local_valid_data}, 0);
+    valid_targets = torch::cat({global_valid_targets, local_valid_targets}, 0);
+
+    num_train_examples = num_global_train_examples + num_local_train_examples;
+    num_valid_examples = num_global_valid_examples + num_local_valid_examples;
+
+    assert(train_data.size(0) == num_train_examples && train_targets.size(0) == num_train_examples);
+    assert(valid_data.size(0) == num_valid_examples && valid_targets.size(0) == num_valid_examples);
+  } else {
+
+    // ========== 关键修改点 2: 只使用全局数据时的多批次划分 ==========
+    // 训练数据    
+    train_data = global_queries_.get().index({torch::indexing::Slice(0, num_train_examples)}).clone();
+    train_targets = torch::from_blob(global_lnn_distances_.data(),
+                                   num_train_examples,
+                                   torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+
+    // 验证数据
+    valid_data = global_queries_.get().index({torch::indexing::Slice(
+        num_train_examples, num_train_examples + num_valid_examples)}).clone();
+    valid_targets = torch::from_blob(global_lnn_distances_.data() + num_train_examples,
+                                   num_valid_examples,
+                                   torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+    
+    // 多个校准集数据
+    for (ID_TYPE batch_idx = 0; batch_idx < num_calib_batches; ++batch_idx) {
+      ID_TYPE start_idx = num_train_examples + num_valid_examples + batch_idx * num_examples_per_calib_batch;
+      ID_TYPE end_idx = std::min(start_idx + num_examples_per_calib_batch, total_examples);
+      
+      calib_data_batches[batch_idx] = global_queries_.get().index({torch::indexing::Slice(
+          start_idx, end_idx)}).clone();
+      
+      calib_target_batches[batch_idx] = torch::from_blob(
+          global_lnn_distances_.data() + start_idx,
+          end_idx - start_idx,
+          torch::TensorOptions().dtype(TORCH_VALUE_TYPE)).to(*device_);
+      
+      // printf("[DEBUG] 校准集 %d: 样本范围 %d-%d, 大小 %d\n", 
+      //        batch_idx + 1, start_idx, end_idx - 1, end_idx - start_idx);
+    }
+  }
+
+
+  // ============================= 6. 数据加载器初始化 ==============================
+  auto train_dataset = upcite::SeriesDataset(train_data, train_targets);
+  auto train_data_loader = torch::data::make_data_loader<torch::data::samplers::RandomSampler>(
+      train_dataset.map(torch::data::transforms::Stack<>()), config_.get().filter_train_batchsize_);
+
+  // ========== 关键修改点 3: 保存验证数据而不是用作校准数据 ==========
+  // 验证数据仅用于模型选择，不再用作校准数据
+  //这里验证集的数据作为conformal的数据
+
+  // 模型初始化 
+  model_ = dstree::get_model(config_);
+  model_->to(*device_);
+
+  // ==================================== 8. 训练准备 ================================
+  // 最佳模型状态跟踪，用于提前终止
+  // for early termination
+  std::unordered_map<std::string, torch::Tensor> best_model_state;
+  VALUE_TYPE best_validation_loss = constant::MAX_VALUE;
+  ID_TYPE best_validation_epoch = -1;
+  // 优化器选择（CNN用Adam，其他用SGD）
+  std::shared_ptr<torch::optim::Optimizer> optimizer = nullptr;
+  if (model_->model_type_ == CNN) {
+    optimizer = std::make_shared<torch::optim::Adam>(model_->parameters(), config_.get().filter_train_learning_rate_);
+  } else {
+    optimizer = std::make_shared<torch::optim::SGD>(model_->parameters(), config_.get().filter_train_learning_rate_);
+  }
+  ID_TYPE initial_cooldown_epochs = config_.get().filter_train_nepoch_ / 2;
+
+  //  学习率调整策略（ReduceLROnPlateau）, 用于验证损失
+  upcite::optim::ReduceLROnPlateau lr_scheduler = upcite::optim::ReduceLROnPlateau(
+      *optimizer, initial_cooldown_epochs, optim::MIN, config_.get().filter_lr_adjust_factor_);
+  // 损失函数（均方误差）
+  torch::nn::MSELoss mse_loss(torch::nn::MSELossOptions().reduction(torch::kMean));
+
+#ifdef DEBUG
+  std::vector<float> train_losses, valid_losses, batch_train_losses;
+  train_losses.reserve(config_.get().filter_train_nepoch_);
+  batch_train_losses.reserve(num_train_examples / config_.get().filter_train_batchsize_ + 1);
+
+  valid_losses.reserve(config_.get().filter_train_nepoch_);
+#endif
+
+  //================================= 9. 训练循环 ==============================
+  torch::Tensor batch_data, batch_target;
+  for (ID_TYPE epoch = 0; epoch < config_.get().filter_train_nepoch_; ++epoch) {
+    model_->train(); // 切换至训练模式
+   
+    // 9.1 前向传播与反向传播
+    for (auto &batch : *train_data_loader) {
+      batch_data = batch.data;
+      batch_target = batch.target;
+
+      optimizer->zero_grad();
+
+      torch::Tensor prediction = model_->forward(batch_data);
+
+      torch::Tensor loss = mse_loss->forward(prediction, batch_target);
+      loss.backward(); // 反向传播
+      // 梯度裁剪防止爆炸
+      if (config_.get().filter_train_clip_grad_) {
+        auto norm = torch::nn::utils::clip_grad_norm_(model_->parameters(),
+                                                      config_.get().filter_train_clip_grad_max_norm_,
+                                                      config_.get().filter_train_clip_grad_norm_type_);
+      }
+      optimizer->step();
+
+#ifdef DEBUG
+      batch_train_losses.push_back(loss.detach().item<float>());
+#endif
+    }
+
+#ifdef DEBUG
+    train_losses.push_back(std::accumulate(batch_train_losses.begin(), batch_train_losses.end(), 0.0)
+                               / static_cast<VALUE_TYPE>(batch_train_losses.size()));
+    batch_train_losses.clear();
+#endif
+
+    // 9.2 验证阶段
+    { // evaluate
+      VALUE_TYPE valid_loss = 0;
+
+      c10::InferenceMode guard;
+      model_->eval();  // 切换至评估模式
+
+      torch::Tensor prediction = model_->forward(valid_data);
+
+      valid_loss = mse_loss->forward(prediction, valid_targets).detach().item<VALUE_TYPE>();
+
+#ifdef DEBUG
+      valid_losses.push_back(valid_loss);
+#endif
+      // 记录最佳模型状态
+      if (epoch > initial_cooldown_epochs) {
+        if (best_validation_loss > valid_loss) {
+          best_validation_loss = valid_loss;
+          best_validation_epoch = epoch;
+
+          for (const auto &pair : model_->named_parameters()) {
+            best_model_state[pair.key()] = pair.value().clone();
+          }
+        }
+      }
+      // 学习率调整与早停策略
+      upcite::optim::LR_RETURN_CODE return_code = lr_scheduler.check_step(valid_loss);
+      if (return_code == upcite::optim::EARLY_STOP) {
+        epoch = config_.get().filter_train_nepoch_;
+      }
+    }
+  }
+
+#ifdef DEBUG
+  spdlog::debug("filter {:d} s{:d} {:s} tloss = {:s}",
+                id_, stream_id, model_setting_ref_.get().model_setting_str,
+                upcite::array2str(train_losses.data(), config_.get().filter_train_nepoch_));
+  spdlog::debug("filter {:d} s{:d} {:s} vloss = {:s}",
+                id_, stream_id, model_setting_ref_.get().model_setting_str,
+                upcite::array2str(valid_losses.data(), config_.get().filter_train_nepoch_));
+#endif
+
+  c10::InferenceMode guard;
+
+// ============================ 10. 模型恢复与预测 =============================
+// 恢复最佳模型状态
+  if (best_validation_epoch > initial_cooldown_epochs) {
+#ifdef DEBUG
+    spdlog::debug("filter {:d} s{:d} {:s} restore from e{:d}, vloss {:.4f}",
+                  id_, stream_id, model_setting_ref_.get().model_setting_str,
+                  best_validation_epoch, best_validation_loss);
+#endif
+
+    for (auto &pair : best_model_state) {
+      model_->named_parameters()[pair.first].detach_();
+      model_->named_parameters()[pair.first].copy_(pair.second);
+    }
+  }
+  // ========== 关键修改点 4: 对全局数据进行预测 ==========
+  // 模型预测
+  model_->eval();
+  auto prediction = model_->forward(global_queries_).detach().cpu();
+  assert(prediction.size(0) == global_data_size_);
+  auto *predictions_array = prediction.detach().cpu().contiguous().data_ptr<VALUE_TYPE>();
+  
+  // !!!!!!!!!!!!!!!!!!1  存储模型预测结果到global_pred_distances_
+  global_pred_distances_.insert(global_pred_distances_.end(), predictions_array, predictions_array + global_data_size_);
+ 
+  // 打印 global_pred_distances_ 的 size
+  // printf("Size of global_pred_distances_: %zu\n", global_pred_distances_.size());
+  #ifdef DEBUG
+  spdlog::info("filter {:d}{:s} s{:d} {:s} g_pred{:s} = {:s}",
+               id_, is_trial ? " (trial)" : "",
+               stream_id, model_setting_ref_.get().model_setting_str,
+               config_.get().filter_remove_square_ ? "" : "_sq",
+               upcite::array2str(predictions_array, global_data_size_));
+
+#endif
+
+  // ========== 关键修改点 5: 多校准集保形预测 ==========
+  if (config_.get().filter_is_conformal_) {
+    //这里就是我们要的，对预测距离进行Conformal Prediction的校准
+    // printf("--------------filter:batch_train()开始多校准集CP处理---------------\n");
+
+    // 存储校准集起始索引信息，供fit_batch_conformal_predictor使用
+    std::vector<ID_TYPE> calib_batch_indices;
+    calib_batch_indices.push_back(num_train_examples + num_valid_examples); // 第一个校准集起始索引
+    
+    for (ID_TYPE batch_idx = 1; batch_idx < num_calib_batches; ++batch_idx) {
+      calib_batch_indices.push_back(calib_batch_indices[batch_idx-1] + num_examples_per_calib_batch);
+    }
+    // 调用多校准集保形预测函数
+    // QYL batch
+    fit_batch_conformal_predictor(is_trial, calib_batch_indices, num_examples_per_calib_batch);
+    // printf("\n");
+  }
+
+ //  net->to(torch::Device(torch::kCPU));
+  c10::cuda::CUDACachingAllocator::emptyCache();
+
+  if (!is_trial) {
+    is_trained_ = true;
+  } else {
+    // TODO should this work around be improved
+    global_pred_distances_.clear();
+  }
+
+  return SUCCESS;
+}
+
+
+
+RESPONSE dstree::Filter::collect_running_info(MODEL_SETTING &model_setting) {
+  model_setting_ref_ = model_setting;
+
+  model_ = dstree::get_model(config_);
+  model_->to(*device_);
+
+  c10::InferenceMode guard;
+  model_->eval();
+
+  if (config_.get().filter_is_conformal_ && !conformal_predictor_->is_fitted()) {
+    printf("-------collect_running_info 进入fit_conformal_predictor(false, true)------------\n");
+    fit_conformal_predictor(false, true);
+  }
+
+  model_setting_ref_.get().gpu_mem_mb = get_memory_footprint(*model_);
+
+  auto trial_query = global_queries_.get().index({torch::indexing::Slice(0, 1)}).clone();
+  auto trial_predictions = make_reserved<VALUE_TYPE>(config_.get().filter_trial_iterations_);
+
+  auto start = std::chrono::high_resolution_clock::now();
+
+  for (ID_TYPE trial_i = 0; trial_i < config_.get().filter_trial_iterations_; ++trial_i) {
+    auto pred = model_->forward(trial_query).item<VALUE_TYPE>();
+
+    if (conformal_predictor_ != nullptr) {
+      pred = conformal_predictor_->predict(pred).left_bound_;
+    }
+
+    if (config_.get().filter_remove_square_) {
+      trial_predictions.push_back(pred * pred);
+    } else {
+      trial_predictions.push_back(pred);
+    }
+  }
+
+  auto stop = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+
+  model_setting_ref_.get().gpu_ms_per_query =
+      static_cast<double_t>(duration.count()) / static_cast<double_t>(config_.get().filter_trial_iterations_);
+
+#ifdef DEBUG
+  spdlog::info("trial {:s} gpu mem = {:.3f}MB, time = {:.6f}mus",
+               model_setting_ref_.get().model_setting_str,
+               model_setting_ref_.get().gpu_mem_mb,
+               model_setting_ref_.get().gpu_ms_per_query);
+#endif
+
+  return SUCCESS;
+}
+
+VALUE_TYPE dstree::Filter::infer(torch::Tensor &query_series) const {
+#ifdef DEBUG
+#ifndef DEBUGGED
+  spdlog::debug("filter {:d} {:b} device {:s}, requested {:b}:{:d}",
+                id_, is_trained_,
+                device_->str(),
+                config_.get().filter_infer_is_gpu_, config_.get().filter_device_id_);
+  spdlog::debug("filter {:d} {:b} query device {:s}, requested {:b}:{:d}",
+                id_, is_trained_,
+                query_series.device().str(),
+                config_.get().filter_infer_is_gpu_, config_.get().filter_device_id_);
+
+  auto paras = model_->parameters();
+  for (ID_TYPE i = 0; i < paras.size(); ++i) {
+    spdlog::debug("filter {:d} {:b} model_p_{:d} device {:s}, requested {:b}:{:d}",
+                  id_, is_trained_,
+                  i, paras[i].device().str(),
+                  config_.get().filter_infer_is_gpu_, config_.get().filter_device_id_);
+  }
+#endif
+#endif
+
+  if (is_trained_) {
+    c10::InferenceMode guard;
+
+    VALUE_TYPE pred = model_->forward(query_series).item<VALUE_TYPE>();
+    if (conformal_predictor_ != nullptr) {
+      pred = conformal_predictor_->predict(pred).left_bound_;
+    }
+
+    if (config_.get().filter_remove_square_) {
+      return pred * pred;
+    } else {
+      return pred;
+    }
+  } else {
+    return constant::MAX_VALUE;
+  }
+}
+
+RESPONSE dstree::Filter::dump(std::ofstream &node_fos) const {
+  node_fos.write(reinterpret_cast<const char *>(&global_data_size_), sizeof(ID_TYPE));
+
+  assert(global_bsf_distances_.size() == global_data_size_);
+  ID_TYPE size_placeholder = global_bsf_distances_.size();
+  node_fos.write(reinterpret_cast<const char *>(&size_placeholder), sizeof(ID_TYPE));
+  if (!global_bsf_distances_.empty()) {
+    node_fos.write(reinterpret_cast<const char *>(global_bsf_distances_.data()),
+                   sizeof(VALUE_TYPE) * global_bsf_distances_.size());
+  }
+
+  assert(global_lnn_distances_.size() == global_data_size_);
+  size_placeholder = global_lnn_distances_.size();
+  node_fos.write(reinterpret_cast<const char *>(&size_placeholder), sizeof(ID_TYPE));
+  if (!global_lnn_distances_.empty()) {
+    node_fos.write(reinterpret_cast<const char *>(global_lnn_distances_.data()),
+                   sizeof(VALUE_TYPE) * global_lnn_distances_.size());
+  }
+
+  assert(lb_distances_.size() == global_data_size_);
+  size_placeholder = lb_distances_.size();
+  node_fos.write(reinterpret_cast<const char *>(&size_placeholder), sizeof(ID_TYPE));
+  if (!lb_distances_.empty()) {
+    node_fos.write(reinterpret_cast<const char *>(lb_distances_.data()), sizeof(VALUE_TYPE) * lb_distances_.size());
+  }
+
+  // currently upper bounds are not being used
+  assert(ub_distances_.size() == 0);
+  size_placeholder = ub_distances_.size();
+  node_fos.write(reinterpret_cast<const char *>(&size_placeholder), sizeof(ID_TYPE));
+  if (!ub_distances_.empty()) {
+    node_fos.write(reinterpret_cast<const char *>(ub_distances_.data()), sizeof(VALUE_TYPE) * ub_distances_.size());
+  }
+
+#ifdef DEBUG
+  spdlog::debug("filter {:d} (trained {:b} active {:b}) n_pred {:d} n_glob {:d} n_local {:d}",
+                id_, is_trained_, is_active_,
+                global_pred_distances_.size(), global_data_size_, local_data_size_);
+#endif
+
+  if (is_trained_) {
+    assert(global_pred_distances_.size() == global_data_size_);
+  } else {
+    assert(global_pred_distances_.empty());
+  }
+  size_placeholder = global_pred_distances_.size();
+  node_fos.write(reinterpret_cast<const char *>(&size_placeholder), sizeof(ID_TYPE));
+  if (!global_pred_distances_.empty()) {
+    node_fos.write(reinterpret_cast<const char *>(global_pred_distances_.data()),
+                   sizeof(VALUE_TYPE) * global_pred_distances_.size());
+  }
+
+  node_fos.write(reinterpret_cast<const char *>(&local_data_size_), sizeof(ID_TYPE));
+
+  if (local_data_size_ > 0) {
+    assert(config_.get().series_length_ * local_data_size_ == local_queries_.size());
+    assert(local_lnn_distances_.size() == local_data_size_);
+
+    size_placeholder = local_queries_.size();
+    node_fos.write(reinterpret_cast<const char *>(&size_placeholder), sizeof(ID_TYPE));
+
+    if (!local_queries_.empty()) {
+      node_fos.write(reinterpret_cast<const char *>(local_queries_.data()),
+                     sizeof(VALUE_TYPE) * local_queries_.size());
+    }
+
+    size_placeholder = local_lnn_distances_.size();
+    node_fos.write(reinterpret_cast<const char *>(&size_placeholder), sizeof(ID_TYPE));
+
+    if (!local_lnn_distances_.empty()) {
+      node_fos.write(reinterpret_cast<const char *>(local_lnn_distances_.data()),
+                     sizeof(VALUE_TYPE) * local_lnn_distances_.size());
+    }
+  }
+
+//  spdlog::debug("dump filter {:d} global {:d} local {:d} active {:b} train {:b}",
+//                id_, global_data_size_, local_data_size_, is_active_, is_trained_);
+
+  if (is_active_) {
+    size_placeholder = model_setting_ref_.get().model_setting_str.size();
+  } else {
+    size_placeholder = -1;
+  }
+  node_fos.write(reinterpret_cast<const char *>(&size_placeholder), sizeof(ID_TYPE));
+  if (is_active_) {
+    node_fos.write(reinterpret_cast<const char *>(model_setting_ref_.get().model_setting_str.data()),
+                   sizeof(model_setting_ref_.get().model_setting_str));
+  }
+
+  ID_TYPE is_trained_placeholder = 0;
+  if (is_trained_) {
+    is_trained_placeholder = 1;
+  }
+  node_fos.write(reinterpret_cast<const char *>(&is_trained_placeholder), sizeof(ID_TYPE));
+  if (is_trained_) {
+    std::string model_filepath = config_.get().dump_filters_folderpath_ + std::to_string(id_) +
+        config_.get().model_dump_file_postfix_;
+
+    torch::save(model_, model_filepath);
+  }
+
+  ID_TYPE is_conformal_placeholder = 0;
+  if (config_.get().filter_is_conformal_) {
+    is_conformal_placeholder = 1;
+  }
+  node_fos.write(reinterpret_cast<const char *>(&is_conformal_placeholder), sizeof(ID_TYPE));
+  if (config_.get().filter_is_conformal_) {
+    conformal_predictor_->dump(node_fos);
+  }
+
+  return SUCCESS;
+}
+
+
+// load 函数
+
+RESPONSE dstree::Filter::load(std::ifstream &node_ifs, void *ifs_buf) {
+  auto ifs_id_buf = reinterpret_cast<ID_TYPE *>(ifs_buf);
+  auto ifs_value_buf = reinterpret_cast<VALUE_TYPE *>(ifs_buf);
+
+  // global_data_size_
+  ID_TYPE read_nbytes = sizeof(ID_TYPE);
+  node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+  global_data_size_ = ifs_id_buf[0];
+
+  // bsf_distances_
+  read_nbytes = sizeof(ID_TYPE);
+  node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+  ID_TYPE size_indicator = ifs_id_buf[0];
+
+  if (size_indicator > 0) {
+    read_nbytes = sizeof(VALUE_TYPE) * size_indicator;
+    node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+    global_bsf_distances_.insert(global_bsf_distances_.begin(), ifs_value_buf, ifs_value_buf + size_indicator);
+  }
+  assert(global_bsf_distances_.size() == global_data_size_);
+//  assert(node_ifs.good());
+
+  // nn_distances_
+  read_nbytes = sizeof(ID_TYPE);
+  node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+  size_indicator = ifs_id_buf[0];
+
+  if (size_indicator > 0) {
+    read_nbytes = sizeof(VALUE_TYPE) * size_indicator;
+    node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+    global_lnn_distances_.insert(global_lnn_distances_.begin(), ifs_value_buf, ifs_value_buf + size_indicator);
+  }
+  assert(global_lnn_distances_.size() == global_data_size_);
+//  assert(node_ifs.good());
+
+  // lb_distances_
+  read_nbytes = sizeof(ID_TYPE);
+  node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+  size_indicator = ifs_id_buf[0];
+
+  if (size_indicator > 0) {
+    read_nbytes = sizeof(VALUE_TYPE) * size_indicator;
+    node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+    lb_distances_.insert(lb_distances_.begin(), ifs_value_buf, ifs_value_buf + size_indicator);
+  }
+  assert(lb_distances_.size() == global_data_size_);
+  assert(node_ifs.good());
+
+  // ub_distances_
+  read_nbytes = sizeof(ID_TYPE);
+  node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+  size_indicator = ifs_id_buf[0];
+
+  if (size_indicator > 0) {
+    read_nbytes = sizeof(VALUE_TYPE) * size_indicator;
+    node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+    ub_distances_.insert(ub_distances_.begin(), ifs_value_buf, ifs_value_buf + size_indicator);
+  }
+  assert(ub_distances_.size() == 0);
+//  assert(node_ifs.good());
+
+  // pred_distances_
+  read_nbytes = sizeof(ID_TYPE);
+  node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+  size_indicator = ifs_id_buf[0];
+
+  if (size_indicator > 0) {
+    read_nbytes = sizeof(VALUE_TYPE) * size_indicator;
+    node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+    global_pred_distances_.insert(global_pred_distances_.begin(), ifs_value_buf, ifs_value_buf + size_indicator);
+    assert(global_pred_distances_.size() == global_data_size_);
+//    assert(node_ifs.good());
+  }
+
+  // local_data_size_
+  read_nbytes = sizeof(ID_TYPE);
+  node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+  local_data_size_ = ifs_id_buf[0];
+
+
+  if (local_data_size_ > 0) {
+    // local_queries_
+    read_nbytes = sizeof(ID_TYPE);
+    node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+    size_indicator = ifs_id_buf[0];
+    assert(size_indicator == config_.get().series_length_ * local_data_size_);
+
+    if (size_indicator > 0) {
+      local_queries_.reserve(size_indicator);
+
+      read_nbytes = sizeof(VALUE_TYPE) * size_indicator;
+      node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+      local_queries_.insert(local_queries_.begin(), ifs_value_buf, ifs_value_buf + size_indicator);
+    }
+
+    // local_lnn_distances_
+    read_nbytes = sizeof(ID_TYPE);
+    node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+    size_indicator = ifs_id_buf[0];
+    assert(size_indicator == local_data_size_);
+
+    if (size_indicator > 0) {
+      local_lnn_distances_.reserve(size_indicator);
+
+      read_nbytes = sizeof(VALUE_TYPE) * size_indicator;
+      node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+      local_lnn_distances_.insert(local_lnn_distances_.begin(), ifs_value_buf, ifs_value_buf + size_indicator);
+    }
+  }
+  assert(local_queries_.size() == config_.get().series_length_ * local_data_size_);
+  assert(local_lnn_distances_.size() == local_data_size_);
+//  assert(node_ifs.good());
+
+  // model_setting_
+  is_active_ = false;
+
+  read_nbytes = sizeof(ID_TYPE);
+  node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+  size_indicator = ifs_id_buf[0];
+  if (size_indicator > 0) {
+    std::string model_setting_str;
+    model_setting_str.resize(size_indicator);
+    node_ifs.read(const_cast<char *>(model_setting_str.data()), size_indicator);
+
+    if (config_.get().to_load_filters_) {
+      model_setting_ = MODEL_SETTING(model_setting_str);
+      model_setting_ref_ = std::ref(model_setting_);
+
+      is_active_ = true;
+    }
+  }
+//  assert(node_ifs.good());
+
+  // model_
+  is_trained_ = false;
+
+  read_nbytes = sizeof(ID_TYPE);
+  node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+  size_indicator = ifs_id_buf[0];
+
+  if (size_indicator == 0 && is_active_) {
+    spdlog::error("loading filter {:d} activated but marked untrained; workaround by setting is_trained_",
+                  id_);
+    size_indicator = 1;
+  }
+
+  if (size_indicator > 0) {
+    std::string model_filepath = config_.get().load_filters_folderpath_ + std::to_string(id_) +
+        config_.get().model_dump_file_postfix_;
+
+    if (!fs::is_regular_file(model_filepath)) {
+      spdlog::error("Empty model_filepath found: {:s}", model_filepath);
+      return FAILURE;
+    }
+
+    if (config_.get().filter_infer_is_gpu_) {
+      // TODO support multiple devices
+      device_ = std::make_unique<torch::Device>(torch::kCUDA,
+                                                static_cast<c10::DeviceIndex>(config_.get().filter_device_id_));
+    } else {
+      device_ = std::make_unique<torch::Device>(torch::kCPU);
+    }
+
+    model_ = dstree::get_model(config_);
+    // TODO check if the to-be-loaded model type matches the persisted model type
+    torch::load(model_, model_filepath);
+    model_->to(*device_);
+
+    model_->eval();
+//  net->to(torch::Device(torch::kCPU));
+    c10::cuda::CUDACachingAllocator::emptyCache();
+
+    if (config_.get().to_load_filters_) {
+      is_trained_ = true;
+    }
+  }
+//  assert(node_ifs.good());
+
+  // conformal_predictor_
+  read_nbytes = sizeof(ID_TYPE);
+  node_ifs.read(static_cast<char *>(ifs_buf), read_nbytes);
+  size_indicator = ifs_id_buf[0];
+  if (size_indicator > 0) {
+    // 添加防御性检查，确保 conformal_predictor_ 已经初始化
+    if (!conformal_predictor_) {
+      // 如果 conformal_predictor_ 未初始化，则根据配置创建一个
+      conformal_predictor_ = std::make_unique<upcite::ConformalRegressor>(
+          config_.get().filter_conformal_core_type_,
+          config_.get().filter_conformal_confidence_);
+      printf("在 load 中为节点 %ld 创建了新的 ConformalPredictor\n", id_);
+    }
+    
+    // 添加防御性 try-catch 块以捕获任何异常
+    try {
+      conformal_predictor_->load(node_ifs, ifs_buf);
+      
+      if (is_active_ && is_trained_ && config_.get().filter_is_conformal_) {
+        // TODO check compatibility between the loaded setting and the new setting
+        printf("节点 %ld: 正在调用 fit_conformal_predictor(false, false)\n", id_);
+        fit_conformal_predictor(false, false);
+      }
+    } catch (const std::exception& e) {
+      printf("加载保形预测器时出错：%s\n", e.what());
+      // 如果加载失败，则不要尝试使用保形预测
+      is_trained_ = false;
+      return FAILURE;
+    } catch (...) {
+      printf("加载保形预测器时发生未知错误\n");
+      is_trained_ = false;
+      return FAILURE;
+    }
+  } else {
+    printf("节点 %ld: 没有保形预测器数据\n", id_);
+  }
+
+  spdlog::debug("load filter {:d} global {:d} local {:d} active {:b} trained {:b}",
+                id_, global_data_size_, local_data_size_, is_active_, is_trained_);
+
+  assert(node_ifs.good());
+  return SUCCESS;
+}
+
+
+
+
+VALUE_TYPE dstree::Filter::get_node_summarization_pruning_frequency() const {
+  if (lb_distances_.empty() || lb_distances_.size() != global_bsf_distances_.size()) {
+    return 0;
+  }
+
+  ID_TYPE pruned_counter = 0;
+  for (ID_TYPE i = 0; i < lb_distances_.size(); ++i) {
+    if (lb_distances_[i] > global_bsf_distances_[i]) {
+      pruned_counter += 1;
+    }
+  }
+
+  return static_cast<VALUE_TYPE>(pruned_counter) / static_cast<VALUE_TYPE>(lb_distances_.size());
+}
+
+VALUE_TYPE upcite::dstree::Filter::get_val_pruning_ratio() const {
+  ID_TYPE num_global_train_examples = global_data_size_ * config_.get().filter_train_val_split_;
+
+  VALUE_TYPE abs_error_interval = get_abs_error_interval();
+  ID_TYPE pruned_counter = 0;
+
+  for (ID_TYPE example_i = num_global_train_examples; example_i < global_data_size_; ++example_i) {
+    if (global_pred_distances_[example_i] - abs_error_interval > global_bsf_distances_[example_i]) {
+      pruned_counter += 1;
+    }
+  }
+
+  ID_TYPE num_global_valid_examples = global_data_size_ - num_global_train_examples;
+  return static_cast<VALUE_TYPE>(pruned_counter) / num_global_valid_examples;
+}

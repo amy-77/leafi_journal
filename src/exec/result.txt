@@ -1,0 +1,22 @@
+[2025-05-03 14:31:09.384] [file_logger_mt] [info] === Phase 2: 执行带过滤器的实际搜索 ===
+[2025-05-03 14:31:09.385] [file_logger_mt] [info] ===== 查询 0 的实际结果 =====
+[2025-05-03 14:31:09.385] [file_logger_mt] [info] query_id = 0, K=1: 距离=55.2932, 节点ID=28, series的全局偏移量=701
+[2025-05-03 14:31:09.385] [file_logger_mt] [info] ===== 查询 1 的实际结果 =====
+[2025-05-03 14:31:09.385] [file_logger_mt] [info] query_id = 1, K=1: 距离=51.2710, 节点ID=31, series的全局偏移量=942
+[2025-05-03 14:31:09.386] [file_logger_mt] [info] ===== 查询 2 的实际结果 =====
+[2025-05-03 14:31:09.386] [file_logger_mt] [info] query_id = 2, K=1: 距离=68.6479, 节点ID=31, series的全局偏移量=235
+[2025-05-03 14:31:09.387] [file_logger_mt] [info] ===== 查询 3 的实际结果 =====
+[2025-05-03 14:31:09.387] [file_logger_mt] [info] query_id = 3, K=1: 距离=84.6629, 节点ID=36, series的全局偏移量=471
+[2025-05-03 14:31:09.387] [file_logger_mt] [info] ===== 查询 4 的实际结果 =====
+[2025-05-03 14:31:09.388] [file_logger_mt] [info] query_id = 4, K=1: 距离=58.4378, 节点ID=33, series的全局偏移量=331
+[2025-05-03 14:31:09.388] [file_logger_mt] [info] ===== 查询 5 的实际结果 =====
+[2025-05-03 14:31:09.388] [file_logger_mt] [info] query_id = 5, K=1: 距离=78.3794, 节点ID=31, series的全局偏移量=47
+[2025-05-03 14:31:09.388] [file_logger_mt] [info] ===== 查询 6 的实际结果 =====
+[2025-05-03 14:31:09.388] [file_logger_mt] [info] query_id = 6, K=1: 距离=83.0555, 节点ID=37, series的全局偏移量=502
+[2025-05-03 14:31:09.389] [file_logger_mt] [info] ===== 查询 7 的实际结果 =====
+[2025-05-03 14:31:09.389] [file_logger_mt] [info] query_id = 7, K=1: 距离=74.3152, 节点ID=47, series的全局偏移量=716
+[2025-05-03 14:31:09.389] [file_logger_mt] [info] ===== 查询 8 的实际结果 =====
+[2025-05-03 14:31:09.389] [file_logger_mt] [info] query_id = 8, K=1: 距离=74.1454, 节点ID=34, series的全局偏移量=230
+[2025-05-03 14:31:09.389] [file_logger_mt] [info] ===== 查询 9 的实际结果 =====
+[2025-05-03 14:31:09.389] [file_logger_mt] [info] query_id = 9, K=1: 距离=65.3641, 节点ID=46, series的全局偏移量=371
+[2025-05-03 14:31:09.390] [file_logger_mt] [info] 查询结果对比已保存到: /home/qwang/projects/leafi/dstree/results_check_error/query_results_comparison.txt

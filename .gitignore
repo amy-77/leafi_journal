@@ -1,0 +1,33 @@
+*.log
+*.csv
+*.h5
+*.npz
+__pycache__/
+*.pyc
+node_modules/
+.env
+
+# 忽略数据和结果目录
+**/dump/
+**/dumps/
+**/result/
+**/results/
+**/exp/
+**/experiments/
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+**/third_party/
+dataset/
+dataset/
+**/index_d1m*/
+**/R99*/
+**/index_dump*/
+**/index_d1m*
+**/index_dump*
+# 忽略大型二进制文件和库
+dstree/lib/
+dstree/log/*.log
+dataset/*.bin
