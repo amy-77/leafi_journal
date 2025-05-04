@@ -1,4 +1,4 @@
-   # [编辑文件内容并保存]
+   # Parameters 
 ./dstree --db_filepath /home/qwang/projects/leafi/dataset/deep1b-96-1m.bin \
 --query_filepath /home/qwang/projects/leafi/dataset/deep1b-96-10m-test-0.4-10k.bin \
 --series_length 96 \
